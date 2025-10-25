@@ -1,18 +1,20 @@
-from fastapi import FastAPI, Depends, HTTPException
+# app/main.py
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from typing import List, Optional
 import requests
-import json
-from typing import List
+import re
 
 from database import get_db, init_db
 from models import Methodic
 from search import search_methodics, format_methodics_for_prompt
 from config import settings
+from pydantic import BaseModel
 
-app = FastAPI(title="Methodics Chat Bot", version="1.0.0")
+app = FastAPI(title="Methodics Chat Bot (Strict Mode)", version="2.6.0")
 
-# CORS middleware
+# ------------------ CORS ------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,193 +24,215 @@ app.add_middleware(
 )
 
 
-# Инициализация базы данных при запуске
+# ------------------ DB INIT ------------------
 @app.on_event("startup")
 def on_startup():
     init_db()
 
 
-# Модели запросов и ответов
-from pydantic import BaseModel
-
-
+# ------------------ MODELS ------------------
 class ChatRequest(BaseModel):
     question: str
     max_results: int = 5
+    full: bool = False
+
+
+class MethodicSnippet(BaseModel):
+    id: int
+    title: str
+    subject: Optional[str] = None
+    author: Optional[str] = None
+    content_snippet: str
 
 
 class ChatResponse(BaseModel):
     answer: str
-    sources: List[dict]
+    sources: List[MethodicSnippet]
     found_methodics: int
 
 
-class MethodicResponse(BaseModel):
-    id: int
-    title: str
-    subject: str
-    author: str
-    content: str
+# ------------------ HELPERS ------------------
+def format_sources(methodics: List[Methodic], full: bool = False) -> List[MethodicSnippet]:
+    """Формирует список источников (отрезки или полные тексты)."""
+    sources = []
+    for m in methodics:
+        text = m.content if full else (m.content[:400] + "..." if len(m.content) > 400 else m.content)
+        sources.append(
+            MethodicSnippet(
+                id=m.id,
+                title=m.title,
+                subject=m.subject,
+                author=m.author,
+                content_snippet=text
+            )
+        )
+    return sources
 
 
-#TODO: Подобрать модель, изменить обработку(опционально)
-def call_groq_api(question: str, context: str) -> str:
-    """Groq API - правильная реализация"""
-    headers = {
-        "Authorization": f"Bearer {settings.GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    prompt = f"""
-    Ты - помощник по методическим материалам. Ответь на вопрос используя ТОЛЬКО предоставленную информацию.
-
-    КОНТЕКСТ ИЗ МЕТОДИЧЕК:
-    {context}
-
-    ВОПРОС: {question}
-
-    Если в контексте нет ответа - вежливо сообщи об этом.
+def extract_from_methodics(question: str, methodics: List[Methodic]) -> Optional[str]:
     """
+    Ищет ключевые слова из вопроса в тексте методичек.
+    Если найдено предложение с совпадением — возвращает его.
+    """
+    if not methodics:
+        return None
 
-    data = {
-        "messages": [
-            {
-                "role": "system",
-                "content": "Ты полезный помощник по методическим материалам. Отвечай точно и по делу."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "model": "llama-3.1-8b-instant",  # ← Используем эту модель
-        "temperature": 0.3,
-        "max_tokens": 1000,
-        "top_p": 0.9
+    keywords = re.findall(r'\w+', question.lower())
+    keywords = [k for k in keywords if len(k) > 2]
+    if not keywords:
+        return None
+
+    found_sentences = []
+    for m in methodics:
+        text = m.content or ""
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        for s in sentences:
+            for kw in keywords:
+                if kw in s.lower():
+                    found_sentences.append(f"Из методички «{m.title}» ({m.author}): {s.strip()}")
+                    break
+
+    if found_sentences:
+        return "\n\n".join(found_sentences[:3])
+    return None
+
+
+# ------------------ GEMINI API ------------------
+def call_gemini_api(question: str, context: str) -> str:
+    """
+    Gemini используется только как инструмент для обобщения контекста.
+    Модель не имеет права добавлять собственные знания.
+    Если данных нет — должна вежливо сообщить об этом.
+    """
+    instruction = (
+        "Ты — помощник по методическим материалам. "
+        "Отвечай строго по приведённому контексту. "
+        "Если в контексте нет ответа — вежливо сообщи, "
+        "что данных по запросу в базе методичек нет, "
+        "и предложи пользователю переформулировать вопрос "
+        "или обратиться к администратору."
+    )
+
+    user_prompt = f"""
+КОНТЕКСТ:
+{context[:6000]}
+
+ВОПРОС:
+{question}
+"""
+
+    url = f"{settings.GEMINI_API_URL}?key={settings.GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    body = {
+        "contents": [{"parts": [{"text": instruction}, {"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 1000,
+            "topP": 0.9
+        }
     }
 
     try:
-        print("🔄 Отправляем запрос к Groq API...")
-        response = requests.post(settings.GROQ_API_URL, headers=headers, json=data, timeout=30)
-        print(f"📡 Статус: {response.status_code}")
-
-        if response.status_code == 200:
-            result = response.json()
-            answer = result['choices'][0]['message']['content']
-            print("✅ Успешный ответ от Groq!")
-            return answer
-        else:
-            print(f"⚠️ Ошибка Groq: {response.status_code} - {response.text[:200]}")
-            return create_fallback_response(question, context)
-
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        if resp.status_code != 200:
+            print(f"⚠️ Ошибка Gemini: {resp.status_code} - {resp.text[:200]}")
+            return ""
+        data = resp.json()
+        answer = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+            .strip()
+        )
+        return answer
     except Exception as e:
-        print(f"💥 Ошибка: {e}")
-        return create_fallback_response(question, context)
+        print(f"💥 Ошибка обращения к Gemini: {e}")
+        return ""
 
-#TODO: Реализовать ответа faq
-def create_fallback_response(question: str, context: str) -> str:
-    """Создает умный ответ когда AI недоступен"""
-    if not context or "Релевантные методички не найдены" in context:
-        return "К сожалению, в базе методичек нет информации по вашему вопросу."
 
-    keywords = {
-        "python": "Python - это язык программирования с простым синтаксисом.",
-        "программирование": "Программирование - создание компьютерных программ.",
-        "база данных": "База данных - организованное хранилище информации.",
-        "sql": "SQL - язык для работы с базами данных.",
-        "математика": "Математика - наука о числах и пространственных формах."
-    }
-
-    question_lower = question.lower()
-    for keyword, answer in keywords.items():
-        if keyword in question_lower:
-            return f"""**Вопрос:** {question}
-
-**Ответ:** {answer}
-
-*Это базовый ответ по ключевому слову. Для более точного ответа дождитесь загрузки AI модели.*"""
-
-    # Если ключевых слов нет, возвращаем контекст
-    return f"""**Вопрос:** {question}
-
-**Информация из методичек:**
-{context[:800]}...
-
-*AI модель временно недоступна. Это сырая информация из методичек.*"""
-
+# ------------------ MAIN LOGIC ------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_methodics(
-        request: ChatRequest,
-        db: Session = Depends(get_db)
+    request: ChatRequest,
+    db: Session = Depends(get_db)
 ):
     """
-    Основной endpoint для чата с ботом
+    Алгоритм:
+    1. Поиск методичек по вопросу.
+    2. Если методички найдены — попытка извлечь ответ локально.
+    3. Если локально не найдено — Gemini формулирует ответ только на основе контекста.
+    4. Если ничего не найдено — возвращается понятное сообщение с рекомендациями.
     """
     methodics = search_methodics(db, request.question, request.max_results)
 
-    context = format_methodics_for_prompt(methodics)
-
-    answer = call_groq_api(request.question, context)
-
-    sources = [
-        {
-            "id": methodic.id,
-            "title": methodic.title,
-            "subject": methodic.subject,
-            "author": methodic.author
-        }
-        for methodic in methodics
-    ]
-
-    return ChatResponse(
-        answer=answer,
-        sources=sources,
-        found_methodics=len(methodics)
-    )
-
-
-@app.get("/search", response_model=List[MethodicResponse])
-async def search_methodics_endpoint(
-        query: str,
-        limit: int = 10,
-        db: Session = Depends(get_db)
-):
-    """
-    Поиск методичек по запросу (прямой поиск без AI)
-    """
-    methodics = search_methodics(db, query, limit)
-    return [
-        MethodicResponse(
-            id=methodic.id,
-            title=methodic.title,
-            subject=methodic.subject,
-            author=methodic.author,
-            content=methodic.content
+    # --- Сценарий 1: нет методичек ---
+    if not methodics:
+        print("❌ Методички не найдены.")
+        answer = (
+            "По вашему запросу в базе методических материалов ничего не найдено. "
+            "Проверьте формулировку вопроса или уточните тему. "
+            "Если проблема повторяется, обратитесь к администратору."
         )
-        for methodic in methodics
-    ]
+        return ChatResponse(answer=answer, sources=[], found_methodics=0)
+
+    sources = format_sources(methodics, request.full)
+
+    # --- Сценарий 2: есть методички, пробуем найти локально ---
+    local_answer = extract_from_methodics(request.question, methodics)
+    if local_answer:
+        print("✅ Найден ответ внутри методичек.")
+        return ChatResponse(answer=local_answer, sources=sources, found_methodics=len(methodics))
+
+    # --- Сценарий 3: методички есть, но локально не найдено — Gemini обобщает контекст ---
+    print("⚙️ Не найдено точного ответа, формируем контекст для Gemini.")
+    context = format_methodics_for_prompt(methodics)
+    gemini_answer = call_gemini_api(request.question, context)
+
+    # --- Проверка результата Gemini ---
+    if not gemini_answer or len(gemini_answer.strip()) < 15:
+        print("⚠️ Gemini не дал содержательного ответа.")
+        gemini_answer = (
+            "Ответ на данный вопрос отсутствует в базе методических материалов. "
+            "Рекомендуется переформулировать запрос или уточнить тему. "
+            "При необходимости обратитесь к администратору для добавления новых данных."
+        )
+
+    return ChatResponse(answer=gemini_answer, sources=sources, found_methodics=len(methodics))
 
 
-@app.get("/methodics/{methodic_id}", response_model=MethodicResponse)
-async def get_methodic(
-        methodic_id: int,
-        db: Session = Depends(get_db)
+# ------------------ /search ------------------
+@app.get("/search", response_model=List[MethodicSnippet])
+async def search_methodics_endpoint(
+    query: str = Query(..., description="Поисковый запрос"),
+    limit: int = Query(10, description="Максимальное количество результатов"),
+    db: Session = Depends(get_db)
 ):
-    """
-    Получение конкретной методички по ID
-    """
+    methodics = search_methodics(db, query, limit)
+    return format_sources(methodics, full=False)
+
+
+# ------------------ /methodics/{id} ------------------
+@app.get("/methodics/{methodic_id}", response_model=MethodicSnippet)
+async def get_methodic(methodic_id: int, db: Session = Depends(get_db)):
     methodic = db.query(Methodic).filter(Methodic.id == methodic_id).first()
     if not methodic:
         raise HTTPException(status_code=404, detail="Методичка не найдена")
-    return methodic
+    return MethodicSnippet(
+        id=methodic.id,
+        title=methodic.title,
+        subject=methodic.subject,
+        author=methodic.author,
+        content_snippet=methodic.content
+    )
 
 
+# ------------------ ROOT ------------------
 @app.get("/")
 async def root():
-    return {"message": "Methodics Chat Bot API", "version": "1.0.0"}
+    return {"message": "Methodics Chat Bot API (Strict Mode)", "version": "2.6.0"}
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
