@@ -1,10 +1,11 @@
-from database import init_db, SessionLocal
-from models import Methodic
+# init_db.py
+from database import engine
+from models import Base
 
-def create_sample_data():
-    """Создает базу данных с примерными данными"""
-    init_db()
-    print("База данных создана с примерными методичками!")
+def init_database():
+    """Инициализация базы данных, создание таблиц"""
+    Base.metadata.create_all(bind=engine)
+    print("Таблицы созданы: methodic_entries, qa_entries")
 
 if __name__ == "__main__":
-    create_sample_data()
+    init_database()

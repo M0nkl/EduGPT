@@ -7,12 +7,17 @@ import requests
 import re
 
 from database import get_db, init_db
-from models import Methodic
-from search import search_methodics, format_methodics_for_prompt
+from models import MethodicEntry, QAEntry
+from search import (
+    search_methodics_with_context,
+    format_context_for_prompt,
+    search_qa_entries,
+    search_methodic_texts
+)
 from config import settings
 from pydantic import BaseModel
 
-app = FastAPI(title="Methodics Chat Bot (Strict Mode)", version="2.6.0")
+app = FastAPI(title="Methodics Chat Bot (Dual Database)", version="3.1.0")
 
 # ------------------ CORS ------------------
 app.add_middleware(
@@ -40,7 +45,6 @@ class ChatRequest(BaseModel):
 class MethodicSnippet(BaseModel):
     id: int
     title: str
-    subject: Optional[str] = None
     author: Optional[str] = None
     content_snippet: str
 
@@ -52,90 +56,70 @@ class ChatResponse(BaseModel):
 
 
 # ------------------ HELPERS ------------------
-def format_sources(methodics: List[Methodic], full: bool = False) -> List[MethodicSnippet]:
-    """Формирует список источников (отрезки или полные тексты)."""
-    sources = []
-    for m in methodics:
-        text = m.content if full else (m.content[:400] + "..." if len(m.content) > 400 else m.content)
-        sources.append(
-            MethodicSnippet(
-                id=m.id,
-                title=m.title,
-                subject=m.subject,
-                author=m.author,
-                content_snippet=text
-            )
-        )
-    return sources
-
-
-def extract_from_methodics(question: str, methodics: List[Methodic]) -> Optional[str]:
+def is_quality_answer(answer: str, question: str) -> bool:
     """
-    Ищет ключевые слова из вопроса в тексте методичек.
-    Если найдено предложение с совпадением — возвращает его.
+    Проверяет качество ответа от Gemini
     """
-    if not methodics:
-        return None
+    if not answer or len(answer.strip()) < 30:
+        return False
+
+    if answer.count('•') > 10 or answer.count('\n-') > 10:
+        return False
 
     keywords = re.findall(r'\w+', question.lower())
-    keywords = [k for k in keywords if len(k) > 2]
-    if not keywords:
-        return None
+    keywords = [k for k in keywords if len(k) > 3]
 
-    found_sentences = []
-    for m in methodics:
-        text = m.content or ""
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        for s in sentences:
-            for kw in keywords:
-                if kw in s.lower():
-                    found_sentences.append(f"Из методички «{m.title}» ({m.author}): {s.strip()}")
-                    break
+    if keywords:
+        answer_lower = answer.lower()
+        matches = sum(1 for kw in keywords if kw in answer_lower)
+        if matches < max(1, len(keywords) * 0.3):
+            return False
 
-    if found_sentences:
-        return "\n\n".join(found_sentences[:3])
-    return None
+    sentences = re.split(r'[.!?]+', answer)
+    if len(sentences) > 8 and len(answer) < 200:
+        return False
+
+    return True
 
 
-# ------------------ GEMINI API ------------------
 def call_gemini_api(question: str, context: str) -> str:
     """
     Gemini используется только как инструмент для обобщения контекста.
-    Модель не имеет права добавлять собственные знания.
-    Если данных нет — должна вежливо сообщить об этом.
     """
-    instruction = (
-        "Ты — помощник по методическим материалам. "
-        "Отвечай строго по приведённому контексту. "
-        "Если в контексте нет ответа — вежливо сообщи, "
-        "что данных по запросу в базе методичек нет, "
-        "и предложи пользователю переформулировать вопрос "
-        "или обратиться к администратору."
-    )
+    instruction = f"""Ты — помощник по методическим материалам. 
 
-    user_prompt = f"""
+ИНСТРУКЦИЯ:
+1. Отвечай СТРОГО на основе приведенного контекста
+2. НЕ добавляй информацию "от себя"
+3. Если в контексте нет ответа — скажи: "В предоставленных материалах нет информации по этому вопросу"
+4. Формулируй ответ своими словами на основе контекста
+5. Структурируй ответ, если возможно
+6. Упомяни источники информации (например: "Согласно методичке №1...")
+7. Отвечай только на заданный вопрос: "{question}"
+
 КОНТЕКСТ:
-{context[:6000]}
+{context[:5000]}
 
 ВОПРОС:
 {question}
-"""
+
+ОТВЕТ (только на основе контекста):"""
 
     url = f"{settings.GEMINI_API_URL}?key={settings.GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     body = {
-        "contents": [{"parts": [{"text": instruction}, {"text": user_prompt}]}],
+        "contents": [{"parts": [{"text": instruction}]}],
         "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1000,
-            "topP": 0.9
+            "temperature": 0.2,
+            "maxOutputTokens": 800,
+            "topP": 0.8
         }
     }
 
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=30)
         if resp.status_code != 200:
-            print(f"⚠️ Ошибка Gemini: {resp.status_code} - {resp.text[:200]}")
+            print(f"Ошибка Gemini: {resp.status_code} - {resp.text[:200]}")
             return ""
         data = resp.json()
         answer = (
@@ -147,92 +131,246 @@ def call_gemini_api(question: str, context: str) -> str:
         )
         return answer
     except Exception as e:
-        print(f"💥 Ошибка обращения к Gemini: {e}")
+        print(f"Ошибка обращения к Gemini: {e}")
         return ""
+
+
+def format_manual_answer(search_results: dict, question: str) -> str:
+    """
+    Формирует осмысленный ответ вручную, если Gemini не справился
+    """
+    if not search_results['methodic_contexts']:
+        return "К сожалению, в методических материалах не найдено информации по вашему вопросу."
+
+    keywords = re.findall(r'\w+', question.lower())
+    keywords = [k for k in keywords if len(k) > 3]
+
+    best_sentences = []
+
+    for ctx in search_results['methodic_contexts'][:2]:
+        if ctx['relevant_sentences']:
+            for sentence in ctx['relevant_sentences'][:2]:
+                sentence_lower = sentence.lower()
+                relevance = sum(1 for kw in keywords if kw in sentence_lower) if keywords else 1
+
+                if relevance > 0 or not keywords:
+                    clean_sentence = re.sub(r'\s+', ' ', sentence).strip()
+                    if len(clean_sentence) > 10:
+                        best_sentences.append(clean_sentence)
+
+    if not best_sentences:
+        return "В найденных материалах есть информация, но она недостаточно релевантна вашему вопросу."
+
+    answer_parts = ["На основе анализа методических материалов:"]
+
+    unique_sentences = []
+    for sentence in best_sentences[:4]:
+        if len(sentence) > 20 and sentence not in unique_sentences:
+            unique_sentences.append(sentence)
+
+    for i, sentence in enumerate(unique_sentences, 1):
+        answer_parts.append(f"{i}. {sentence}")
+
+    answer_parts.append("\nДля получения более подробной информации уточните ваш вопрос.")
+
+    return "\n".join(answer_parts)
 
 
 # ------------------ MAIN LOGIC ------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_methodics(
-    request: ChatRequest,
-    db: Session = Depends(get_db)
+        request: ChatRequest,
+        db: Session = Depends(get_db)
 ):
     """
-    Алгоритм:
-    1. Поиск методичек по вопросу.
-    2. Если методички найдены — попытка извлечь ответ локально.
-    3. Если локально не найдено — Gemini формулирует ответ только на основе контекста.
-    4. Если ничего не найдено — возвращается понятное сообщение с рекомендациями.
+    Улучшенный алгоритм:
+    1. Сначала ищем похожие вопросы в qa_entries
+    2. Если найдены - возвращаем готовые ответы
+    3. Если нет - ищем в methodic_entries и обрабатываем через Gemini
+    4. Проверяем качество ответа от Gemini
     """
-    methodics = search_methodics(db, request.question, request.max_results)
+    print(f"\n{'=' * 50}")
+    print(f"Вопрос: {request.question}")
 
-    # --- Сценарий 1: нет методичек ---
-    if not methodics:
-        print("❌ Методички не найдены.")
+    # --- Шаг 1: Ищем в базе готовых Q&A ---
+    qa_results = search_qa_entries(db, request.question, threshold=0.6, limit=request.max_results)
+
+    if qa_results:
+        print(f"Найдено {len(qa_results)} готовых ответов в Q&A")
+
+        # Формируем ответ из Q&A
+        if len(qa_results) == 1:
+            answer = qa_results[0].answer
+        else:
+            # Объединяем несколько ответов
+            answer_parts = ["Найдено несколько похожих вопросов:"]
+            for i, qa in enumerate(qa_results[:3], 1):  # Берем до 3 ответов
+                answer_parts.append(f"\n{i}. {qa.answer}")
+            answer = "\n".join(answer_parts)
+
+
+        sources = []
+        for qa in qa_results[:3]:
+            if qa.methodic:
+                sources.append(
+                    MethodicSnippet(
+                        id=qa.methodic.id,
+                        title=qa.methodic.source_title or "Без названия",
+                        author=qa.methodic.author,
+                        content_snippet=f"Связанный вопрос: {qa.question[:150]}..."
+                    )
+                )
+
+        return ChatResponse(
+            answer=answer,
+            sources=sources,
+            found_methodics=len(qa_results)
+        )
+
+    # --- Шаг 2: Ищем в полных текстах методичек ---
+    print("Q&A не найдены, ищем в полных текстах...")
+    search_results = search_methodics_with_context(db, request.question, request.max_results)
+
+    # Если ничего не найдено
+    if not search_results['methodic_contexts']:
+        print("Ничего не найдено в текстах методичек.")
         answer = (
-            "По вашему запросу в базе методических материалов ничего не найдено. "
-            "Проверьте формулировку вопроса или уточните тему. "
-            "Если проблема повторяется, обратитесь к администратору."
+            "По вашему запросу не найдено информации в методических материалах. "
+            "Попробуйте переформулировать вопрос или обратитесь к администратору."
         )
         return ChatResponse(answer=answer, sources=[], found_methodics=0)
 
-    sources = format_sources(methodics, request.full)
+    print(f"Найдено {len(search_results['methodic_contexts'])} релевантных методичек")
 
-    # --- Сценарий 2: есть методички, пробуем найти локально ---
-    local_answer = extract_from_methodics(request.question, methodics)
-    if local_answer:
-        print("✅ Найден ответ внутри методичек.")
-        return ChatResponse(answer=local_answer, sources=sources, found_methodics=len(methodics))
+    # --- Шаг 3: Формируем контекст и отправляем в Gemini ---
+    context = format_context_for_prompt(search_results, request.question)  # Передаем вопрос
+    print(f"Длина контекста: {len(context)} символов")
 
-    # --- Сценарий 3: методички есть, но локально не найдено — Gemini обобщает контекст ---
-    print("⚙️ Не найдено точного ответа, формируем контекст для Gemini.")
-    context = format_methodics_for_prompt(methodics)
     gemini_answer = call_gemini_api(request.question, context)
 
-    # --- Проверка результата Gemini ---
-    if not gemini_answer or len(gemini_answer.strip()) < 15:
-        print("⚠️ Gemini не дал содержательного ответа.")
-        gemini_answer = (
-            "Ответ на данный вопрос отсутствует в базе методических материалов. "
-            "Рекомендуется переформулировать запрос или уточнить тему. "
-            "При необходимости обратитесь к администратору для добавления новых данных."
-        )
+    # --- Шаг 4: Проверяем качество ответа Gemini ---
+    if gemini_answer and is_quality_answer(gemini_answer, request.question):
+        print("Gemini дал качественный ответ")
+        answer = gemini_answer
+    else:
+        print("Gemini не дал качественного ответа, формируем вручную")
+        answer = format_manual_answer(search_results, request.question)
 
-    return ChatResponse(answer=gemini_answer, sources=sources, found_methodics=len(methodics))
+    # --- Шаг 5: Формируем источники для ответа ---
+    sources = []
+    if search_results['methodic_contexts']:
+        for ctx in search_results['methodic_contexts'][:5]:
+            methodic = ctx['methodic']
 
+            # Формируем осмысленный сниппет
+            if ctx['relevant_sentences']:
+                # Берем самое релевантное предложение
+                best_sentence = ctx['relevant_sentences'][0]
+                clean_sentence = re.sub(r'\s+', ' ', best_sentence).strip()
+                if len(clean_sentence) > 300:
+                    clean_sentence = clean_sentence[:300] + "..."
+                snippet = clean_sentence
+            else:
+                snippet = methodic.methodic_text[:200] + "..." if methodic.methodic_text else ""
 
-# ------------------ /search ------------------
-@app.get("/search", response_model=List[MethodicSnippet])
-async def search_methodics_endpoint(
-    query: str = Query(..., description="Поисковый запрос"),
-    limit: int = Query(10, description="Максимальное количество результатов"),
-    db: Session = Depends(get_db)
-):
-    methodics = search_methodics(db, query, limit)
-    return format_sources(methodics, full=False)
+            sources.append(
+                MethodicSnippet(
+                    id=methodic.id,
+                    title=methodic.source_title or "Без названия",
+                    author=methodic.author,
+                    content_snippet=snippet
+                )
+            )
 
+    print(f"Ответ сформирован, источников: {len(sources)}")
 
-# ------------------ /methodics/{id} ------------------
-@app.get("/methodics/{methodic_id}", response_model=MethodicSnippet)
-async def get_methodic(methodic_id: int, db: Session = Depends(get_db)):
-    methodic = db.query(Methodic).filter(Methodic.id == methodic_id).first()
-    if not methodic:
-        raise HTTPException(status_code=404, detail="Методичка не найдена")
-    return MethodicSnippet(
-        id=methodic.id,
-        title=methodic.title,
-        subject=methodic.subject,
-        author=methodic.author,
-        content_snippet=methodic.content
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        found_methodics=len(search_results['methodic_contexts'])
     )
 
 
-# ------------------ ROOT ------------------
+# ------------------ SEARCH ENDPOINT ------------------
+@app.get("/search", response_model=List[MethodicSnippet])
+async def search_methodics_endpoint(
+        query: str = Query(..., description="Поисковый запрос"),
+        limit: int = Query(10, description="Максимальное количество результатов"),
+        db: Session = Depends(get_db)
+):
+    methodic_results = search_methodic_texts(db, query, limit)
+
+    sources = []
+    for methodic in methodic_results:
+        preview = methodic.methodic_text[:200] + "..." if methodic.methodic_text and len(
+            methodic.methodic_text) > 200 else methodic.methodic_text
+
+        sources.append(
+            MethodicSnippet(
+                id=methodic.id,
+                title=methodic.source_title or "Без названия",
+                author=methodic.author,
+                content_snippet=preview or ""
+            )
+        )
+
+    return sources
+
+
+# ------------------ GET METHODIC BY ID ------------------
+@app.get("/methodics/{methodic_id}", response_model=MethodicSnippet)
+async def get_methodic(methodic_id: int, db: Session = Depends(get_db)):
+    methodic = db.query(MethodicEntry).filter(MethodicEntry.id == methodic_id).first()
+    if not methodic:
+        raise HTTPException(status_code=404, detail="Методичка не найдена")
+
+    return MethodicSnippet(
+        id=methodic.id,
+        title=methodic.source_title or "Без названия",
+        author=methodic.author,
+        content_snippet=methodic.methodic_text or ""
+    )
+
+
+# ------------------ Q&A SEARCH ENDPOINT ------------------
+@app.get("/qa/search")
+async def search_qa(
+        query: str = Query(..., description="Поисковый запрос"),
+        threshold: float = Query(0.5, description="Порог схожести (0-1)"),
+        limit: int = Query(5, description="Максимальное количество результатов"),
+        db: Session = Depends(get_db)
+):
+    qa_results = search_qa_entries(db, query, threshold, limit)
+
+    results = []
+    for qa in qa_results:
+        results.append({
+            "id": qa.id,
+            "question": qa.question,
+            "answer": qa.answer,
+            "methodic_title": qa.methodic.source_title if qa.methodic else None,
+            "methodic_author": qa.methodic.author if qa.methodic else None
+        })
+
+    return {"results": results, "count": len(results)}
+
+
+# ------------------ ROOT ENDPOINT ------------------
 @app.get("/")
 async def root():
-    return {"message": "Methodics Chat Bot API (Strict Mode)", "version": "2.6.0"}
+    return {
+        "message": "Methodics Chat Bot API (Dual Database)",
+        "version": "3.1.0",
+        "endpoints": [
+            "POST /chat - Чат с поиском по Q&A и методичкам",
+            "GET /search - Поиск по методичкам",
+            "GET /qa/search - Поиск по Q&A",
+            "GET /methodics/{id} - Получить методичку по ID"
+        ]
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
